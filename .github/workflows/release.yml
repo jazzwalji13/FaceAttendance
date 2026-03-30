@@ -1,0 +1,31 @@
+name: Release on Tag
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Create source archive
+        run: |
+          git archive \
+            --format=zip \
+            --output "FaceAttendance-${GITHUB_REF_NAME}.zip" \
+            HEAD
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: FaceAttendance ${{ github.ref_name }}
+          files: FaceAttendance-${{ github.ref_name }}.zip
+          generate_release_notes: true
