@@ -1,0 +1,17 @@
+{
+  "face_distance_threshold": 0.46354910731315613,
+  "face_distance_margin": 0.05873000621795654,
+  "deepface_cosine_threshold": 0.7000715136528015,
+  "orb_cosine_threshold": 0.8,
+  "cosine_margin": 0.09418400228023528,
+  "min_mark_confidence": 78.0,
+  "per_student_distance_thresholds": {
+    "RA2311003050095": 0.3902849853038788,
+    "098": 0.34
+  },
+  "per_student_cosine_thresholds": {
+    "RA2311003050112": 0.6800393462181091,
+    "RA2311003050024": 0.6993101239204407
+  },
+  "updated_at": "2026-03-25"
+}

@@ -1,0 +1,21 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Logs and local artifacts
+*.log
+app.log
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+
+# Build and test
+.pytest_cache/
+.mypy_cache/
