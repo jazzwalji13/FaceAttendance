@@ -1,11 +1,11 @@
 from __future__ import annotations
 
+from concurrent.futures import Future, ThreadPoolExecutor
 import logging
 import math
 import re
 import sys
 from datetime import datetime
-from pathlib import Path
 from tkinter import *
 from tkinter import filedialog, messagebox, ttk
 
@@ -16,11 +16,11 @@ from database.db import Database
 from database.repository import AttendanceRepository
 from models.entities import Student
 from services.camera_service import CameraService
+from services.diagnostics_service import DiagnosticsService
 from services.face_engine import FaceEngine
 from services.recognition_service import RecognitionService
 from services.training_service import TrainingService
 from utils.config import (
-    CALIBRATION_PATH,
     CAPTURE_MIN_FACE_HEIGHT,
     CAPTURE_MIN_FACE_WIDTH,
     CAPTURE_MIN_SHARPNESS,
@@ -38,7 +38,7 @@ class FaceAttendanceUI:
         self.root.title("Face Recognition Attendance System")
         self.root.geometry("1240x760")
         self.root.minsize(1080, 680)
-        self.root.configure(bg="#f5f7fb")
+        self.root.configure(bg="#0a0b10")
 
         self.db = Database()
         self.db.initialize()
@@ -46,6 +46,7 @@ class FaceAttendanceUI:
         self.face_engine = FaceEngine()
         self.training_service = TrainingService(self.repository)
         self.recognition_service = RecognitionService(self.repository, self.face_engine)
+        self.diagnostics_service = DiagnosticsService(self.repository, self.face_engine, self.recognition_service)
         self.camera_service = CameraService(camera_index=0)
 
         self.active_page = StringVar(value="dashboard")
@@ -56,16 +57,27 @@ class FaceAttendanceUI:
         self._ambient_job: str | None = None
         self._clock_glow_job: str | None = None
         self._counter_jobs: list[str] = []
+        self._attendance_refresh_job: str | None = None
+        self._attendance_refresh_ticks = 0
         self._pulse_tick = 0
         self._ambient_tick = 0
-        self._active_nav_palette = ["#2f7de1", "#3487ef", "#3f93ff", "#3487ef"]
+        self._active_nav_palette = ["#00f5ff", "#00d1e0", "#00a9b3", "#00d1e0"]
         self._frame_counter = 0
-        self._cached_faces: list[tuple[int, int, int, int]] = []
-        self._cached_predictions: list[tuple[str | None, float, float]] = []
+        self._cached_faces = []
+        self._cached_predictions = []
+        self._recognition_streaks = {}
         self._detect_stride = 2
         self._camera_mode = "idle"
+        self._attendance_dirty = False
+        self._student_name_cache: dict[str, str] = {}
+        self._low_motion_mode = False
+        self._analysis_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="frame-analyzer")
+        self._analysis_future: Future | None = None
+        self._latest_analysis: dict | None = None
 
         self.setup_styles()
+
+        self.refresh_student_name_cache()
         self.build_layout()
         self.start_ui_animations()
         self.show_page("dashboard")
@@ -76,19 +88,31 @@ class FaceAttendanceUI:
         style = ttk.Style()
         style.theme_use("clam")
 
-        style.configure("App.TFrame", background="#eef3fb")
-        style.configure("Sidebar.TFrame", background="#16213a")
-        style.configure("Content.TFrame", background="#eef3fb")
-        style.configure("Card.TFrame", background="white")
-        style.configure("CardTitle.TLabel", font=("Segoe UI Semibold", 11), background="white", foreground="#1e273a")
-        style.configure("CardValue.TLabel", font=("Segoe UI Semibold", 20), background="white", foreground="#103362")
-        style.configure("Heading.TLabel", font=("Segoe UI Semibold", 20), background="#eef3fb", foreground="#10264a")
-        style.configure("Sub.TLabel", font=("Segoe UI", 10), background="#eef3fb", foreground="#53617c")
-        style.configure("GlowSub.TLabel", font=("Segoe UI", 10), background="#eef3fb", foreground="#2d4f86")
-        style.configure("White.TLabel", font=("Segoe UI", 10), background="#16213a", foreground="#e4ecfa")
-        style.configure("Treeview", rowheight=28, font=("Segoe UI", 10))
-        style.configure("Treeview.Heading", font=("Segoe UI Semibold", 10))
-        style.configure("PulseSub.TLabel", font=("Segoe UI Semibold", 10), background="#eef3fb", foreground="#2f7de1")
+        # Obsidian Glass / Cyberpunk Palette
+        bg_app = "#06070a"      # Black Obsidian
+        bg_sidebar = "#0a0c12"  # Deep Charcoal
+        bg_card = "#121620"     # Obsidian Glass
+        fg_text = "#a0a5b8"     # Cool Gray
+        fg_heading = "#00f5ff"  # Neon Cyan
+        fg_value = "#ffffff"    # Pure White
+        accent_blue = "#0077ff" # Electric Blue
+
+        style.configure("App.TFrame", background=bg_app)
+        style.configure("Sidebar.TFrame", background=bg_sidebar)
+        style.configure("Content.TFrame", background=bg_app)
+        style.configure("Card.TFrame", background=bg_card, bordercolor="#1e2636", relief="flat", borderwidth=1)
+        style.configure("CardTitle.TLabel", font=("Bahnschrift", 12, "bold"), background=bg_card, foreground=fg_heading)
+        style.configure("CardValue.TLabel", font=("Bahnschrift", 22, "bold"), background=bg_card, foreground=fg_value)
+        style.configure("Heading.TLabel", font=("Bahnschrift", 20, "bold"), background=bg_app, foreground=fg_heading)
+        style.configure("Sub.TLabel", font=("Bahnschrift", 10), background=bg_app, foreground=fg_text)
+        style.configure("GlowSub.TLabel", font=("Bahnschrift", 10, "bold"), background=bg_app, foreground=fg_heading)
+        style.configure("White.TLabel", font=("Bahnschrift", 10), background=bg_sidebar, foreground="#5c6370")
+        
+        style.configure("Treeview", rowheight=32, font=("Bahnschrift", 10), background=bg_card, foreground=fg_text, fieldbackground=bg_card, borderwidth=0)
+        style.map("Treeview", background=[("selected", "#1a2a40")], foreground=[("selected", "#00f5ff")])
+        style.configure("Treeview.Heading", font=("Bahnschrift", 11, "bold"), background=bg_sidebar, foreground=fg_heading, relief="flat")
+        style.configure("PulseSub.TLabel", font=("Bahnschrift", 10, "bold"), background=bg_app, foreground=accent_blue)
+
 
     def build_layout(self) -> None:
         self.main_frame = ttk.Frame(self.root, style="App.TFrame")
@@ -109,60 +133,59 @@ class FaceAttendanceUI:
         Label(
             self.sidebar,
             text="FACE ATTENDANCE",
-            font=("Segoe UI Semibold", 15),
-            bg="#16213a",
-            fg="white",
+            font=("Bahnschrift", 15, "bold"),
+            bg="#0a0c12",
+            fg="#00f5ff",
             padx=14,
-            pady=18,
+            pady=24,
             anchor="w",
-            wraplength=205,
         ).pack(fill=X)
 
         Label(
             self.sidebar,
-            text="AI Production Edition",
-            font=("Segoe UI", 9),
-            bg="#16213a",
-            fg="#a8b3c7",
+            text="NEURAL CORE v2.0",
+            font=("Consolas", 8),
+            bg="#0a0c12",
+            fg="#4a5568",
             padx=14,
-            pady=2,
+            pady=0,
             anchor="w",
-            wraplength=205,
         ).pack(fill=X)
 
         self.nav_buttons: dict[str, Button] = {}
         nav_items = [
-            ("dashboard", "Dashboard"),
-            ("students", "Student Registry"),
-            ("capture", "Face Capture"),
-            ("live_attendance", "Live Attendance"),
-            ("diagnostics", "Diagnostics"),
-            ("attendance", "Attendance Log"),
+            ("dashboard", "DASHBOARD"),
+            ("students", "DATABASE"),
+            ("capture", "ACQUISITION"),
+            ("live_attendance", "LIVE STREAM"),
+            ("diagnostics", "CORE DIAGS"),
+            ("training", "NEURAL TRAIN"),
+            ("attendance", "LOG HISTORY"),
         ]
 
-        nav_wrap = Frame(self.sidebar, bg="#16213a")
-        nav_wrap.pack(fill=X, pady=22)
+        nav_wrap = Frame(self.sidebar, bg="#0a0c12")
+        nav_wrap.pack(fill=X, pady=30)
 
         for key, text in nav_items:
             btn = Button(
                 nav_wrap,
                 text=text,
-                font=("Segoe UI Semibold", 10),
-                bg="#1f3157",
-                fg="#eef3ff",
-                activebackground="#3a4f80",
-                activeforeground="white",
+                font=("Bahnschrift", 10),
+                bg="#06070a",
+                fg="#a0a5b8",
+                activebackground="#1a2a40",
+                activeforeground="#00f5ff",
                 relief=FLAT,
                 bd=0,
-                padx=12,
-                pady=10,
+                padx=16,
+                pady=12,
                 anchor="w",
                 command=lambda k=key: self.show_page(k),
             )
-            btn.pack(fill=X, padx=14, pady=5)
+            btn.pack(fill=X, padx=10, pady=2)
             self.nav_buttons[key] = btn
 
-        footer_box = Frame(self.sidebar, bg="#16213a")
+        footer_box = Frame(self.sidebar, bg="#171a22")
         footer_box.pack(side=BOTTOM, fill=X, padx=14, pady=14)
         ttk.Label(footer_box, text="MVC | SQLite | OpenCV", style="White.TLabel").pack(anchor="w")
         ttk.Label(footer_box, text="Realtime Recognition", style="White.TLabel").pack(anchor="w")
@@ -178,10 +201,10 @@ class FaceAttendanceUI:
         self.clock_label.pack(side=RIGHT, padx=(0, 20))
         self.update_clock()
 
-        self.ambient_canvas = Canvas(self.content, height=56, bg="#eef3fb", highlightthickness=0)
+        self.ambient_canvas = Canvas(self.content, height=56, bg="#111318", highlightthickness=0)
         self.ambient_canvas.pack(fill=X, padx=26, pady=(0, 0))
 
-        self.transition_canvas = Canvas(self.content, height=5, bg="#eef3fb", highlightthickness=0)
+        self.transition_canvas = Canvas(self.content, height=5, bg="#111318", highlightthickness=0)
         self.transition_canvas.pack(fill=X, padx=26, pady=(0, 6))
 
         self.body = ttk.Frame(self.content, style="Content.TFrame")
@@ -203,11 +226,19 @@ class FaceAttendanceUI:
 
     def clear_body(self) -> None:
         self.stop_camera_preview()
+        self.stop_attendance_auto_refresh()
         self._camera_mode = "idle"
         self._cached_faces = []
         self._cached_predictions = []
+        self._recognition_streaks = {}
         for child in self.body.winfo_children():
             child.destroy()
+
+    def refresh_student_name_cache(self) -> None:
+        self._student_name_cache = {
+            student["student_id"]: student["full_name"]
+            for student in self.repository.list_students()
+        }
 
     def show_page(self, page_key: str) -> None:
         self.active_page.set(page_key)
@@ -229,7 +260,7 @@ class FaceAttendanceUI:
 
     def highlight_active_button(self) -> None:
         for key, button in self.nav_buttons.items():
-            button.config(bg="#2f7de1" if key == self.active_page.get() else "#1f3157")
+            button.config(bg=self._active_nav_palette[0] if key == self.active_page.get() else "#111318")
 
     def start_ui_animations(self) -> None:
         self.animate_active_nav_pulse()
@@ -243,10 +274,11 @@ class FaceAttendanceUI:
                 palette_index = self._pulse_tick % len(self._active_nav_palette)
                 button.config(bg=self._active_nav_palette[palette_index])
             else:
-                button.config(bg="#1f3157")
+                button.config(bg="#111318")
 
         self._pulse_tick += 1
-        self._nav_pulse_job = self.root.after(240, self.animate_active_nav_pulse)
+        interval = 420 if self._low_motion_mode else 240
+        self._nav_pulse_job = self.root.after(interval, self.animate_active_nav_pulse)
 
     def animate_page_transition(self) -> None:
         if not hasattr(self, "transition_canvas"):
@@ -267,8 +299,8 @@ class FaceAttendanceUI:
 
         def step(position: int) -> None:
             canvas.delete("all")
-            canvas.create_rectangle(0, 0, width, 5, fill="#d8e5fb", outline="")
-            canvas.create_rectangle(position, 0, position + bar_width, 5, fill="#2f7de1", outline="")
+            canvas.create_rectangle(0, 0, width, 5, fill="#06070a", outline="")
+            canvas.create_rectangle(position, 0, position + bar_width, 5, fill="#00f5ff", outline="")
             if position < width:
                 self._transition_job = self.root.after(16, lambda: step(position + 28))
 
@@ -284,9 +316,14 @@ class FaceAttendanceUI:
         if width <= 1:
             width = max(self.content.winfo_width() - 52, 300)
 
-        canvas.create_rectangle(0, 0, width, 56, fill="#eef3fb", outline="")
+        canvas.create_rectangle(0, 0, width, 56, fill="#06070a", outline="")
 
-        for idx, color in enumerate(["#d9e9ff", "#c7dcff", "#b7d2ff"]):
+        if self._low_motion_mode:
+            self._ambient_job = self.root.after(400, self.animate_ambient_glow)
+            return
+
+        # Cyberpunk Neon Glow - Cyan/Blue
+        for idx, color in enumerate(["#0a1a20", "#0e2630", "#123040"]):
             x_center = (self._ambient_tick * (1.6 + idx * 0.25) + idx * 320) % (width + 260) - 130
             y_center = 20 + (idx * 9)
             radius = 110 - idx * 16
@@ -299,7 +336,7 @@ class FaceAttendanceUI:
                 outline="",
             )
 
-        for idx, color in enumerate(["#eaf2ff", "#ddeafe"]):
+        for idx, color in enumerate(["#0a1530", "#0e1c40"]):
             x_center = width - (((self._ambient_tick * (1.2 + idx * 0.2)) + idx * 260) % (width + 220)) + 80
             y_center = 36 + (idx * 8)
             radius = 84 - idx * 12
@@ -319,7 +356,8 @@ class FaceAttendanceUI:
         wave = (math.sin(self._pulse_tick / 2.8) + 1) / 2
         style_name = "GlowSub.TLabel" if wave > 0.5 else "Sub.TLabel"
         self.clock_label.configure(style=style_name)
-        self._clock_glow_job = self.root.after(280, self.animate_clock_glow)
+        interval = 480 if self._low_motion_mode else 280
+        self._clock_glow_job = self.root.after(interval, self.animate_clock_glow)
 
     def create_card(self, parent, title: str, value: str, subtext: str):
         card = ttk.Frame(parent, style="Card.TFrame", padding=16)
@@ -457,15 +495,15 @@ class FaceAttendanceUI:
             entry.grid(row=i + 1, column=1, sticky="w", pady=6)
             self.student_fields[field_key] = entry
 
-        btn_row = Frame(wrapper, bg="white")
+        btn_row = Frame(wrapper, bg="#1f2430")
         btn_row.grid(row=len(fields) + 1, column=1, sticky="w", pady=(14, 8))
 
         Button(
             btn_row,
             text="Save Student",
             font=("Segoe UI", 9, "bold"),
-            bg="#2f7de1",
-            fg="white",
+            bg="#0077ff",
+            fg="#ffffff",
             relief=FLAT,
             bd=0,
             padx=14,
@@ -477,8 +515,8 @@ class FaceAttendanceUI:
             btn_row,
             text="Clear",
             font=("Segoe UI", 9, "bold"),
-            bg="#9099ab",
-            fg="white",
+            bg="#2d3748",
+            fg="#a0a5b8",
             relief=FLAT,
             bd=0,
             padx=14,
@@ -490,8 +528,8 @@ class FaceAttendanceUI:
             btn_row,
             text="Delete Selected",
             font=("Segoe UI", 9, "bold"),
-            bg="#c64545",
-            fg="white",
+            bg="#e53e3e",
+            fg="#ffffff",
             relief=FLAT,
             bd=0,
             padx=14,
@@ -551,6 +589,7 @@ class FaceAttendanceUI:
             phone=payload["phone"],
         )
         self.repository.upsert_student(student)
+        self.refresh_student_name_cache()
         self.refresh_students_table()
         messagebox.showinfo("Student Registry", "Student saved successfully")
 
@@ -590,6 +629,7 @@ class FaceAttendanceUI:
             return
 
         self.refresh_students_table()
+        self.refresh_student_name_cache()
         self.refresh_capture_student_ids()
         self.recognition_service.refresh_model()
         messagebox.showinfo(
@@ -608,7 +648,7 @@ class FaceAttendanceUI:
         ttk.Label(wrapper, text="Face Capture & Recognition", style="CardTitle.TLabel").pack(anchor="w")
         ttk.Label(wrapper, text="Capture face samples only. Attendance marking is on the Live Attendance page.", style="Sub.TLabel").pack(anchor="w", pady=(4, 12))
 
-        controls = Frame(wrapper, bg="white")
+        controls = Frame(wrapper, bg="#1f2430")
         controls.pack(fill=X, pady=(0, 10))
 
         guide = ttk.Label(
@@ -631,8 +671,8 @@ class FaceAttendanceUI:
             controls,
             text="Refresh IDs",
             font=("Segoe UI", 9, "bold"),
-            bg="#9099ab",
-            fg="white",
+            bg="#2d3748",
+            fg="#a0a5b8",
             relief=FLAT,
             bd=0,
             padx=12,
@@ -644,8 +684,8 @@ class FaceAttendanceUI:
             controls,
             text="Start Camera",
             font=("Segoe UI", 9, "bold"),
-            bg="#2f7de1",
-            fg="white",
+            bg="#0077ff",
+            fg="#ffffff",
             relief=FLAT,
             bd=0,
             padx=12,
@@ -657,8 +697,8 @@ class FaceAttendanceUI:
             controls,
             text="Capture Sample",
             font=("Segoe UI", 9, "bold"),
-            bg="#2f7de1",
-            fg="white",
+            bg="#00f5ff",
+            fg="#000000",
             relief=FLAT,
             bd=0,
             padx=12,
@@ -670,8 +710,8 @@ class FaceAttendanceUI:
             controls,
             text="Stop Camera",
             font=("Segoe UI", 9, "bold"),
-            bg="#9099ab",
-            fg="white",
+            bg="#2d3748",
+            fg="#a0a5b8",
             relief=FLAT,
             bd=0,
             padx=12,
@@ -681,10 +721,10 @@ class FaceAttendanceUI:
 
         Button(
             controls,
-            text="Delete Selected Sample",
+            text="Delete Selected",
             font=("Segoe UI", 9, "bold"),
-            bg="#c64545",
-            fg="white",
+            bg="#e53e3e",
+            fg="#ffffff",
             relief=FLAT,
             bd=0,
             padx=12,
@@ -696,8 +736,8 @@ class FaceAttendanceUI:
             controls,
             text="Delete All Samples",
             font=("Segoe UI", 9, "bold"),
-            bg="#8a2f2f",
-            fg="white",
+            bg="#7a332c",
+            fg="#ffcf8f",
             relief=FLAT,
             bd=0,
             padx=12,
@@ -705,7 +745,7 @@ class FaceAttendanceUI:
             command=self.delete_all_samples_for_selected_student,
         ).pack(side=LEFT)
 
-        self.camera_label = Label(wrapper, text="Camera not running", bg="#d9deea", fg="#4a5470", font=("Segoe UI", 12, "bold"))
+        self.camera_label = Label(wrapper, text="Camera not running", bg="#1f2430", fg="#e2c8a0", font=("Segoe UI", 12, "bold"))
         self.camera_label.pack(fill=BOTH, expand=True, pady=(10, 10))
 
         self.recognition_status = ttk.Label(wrapper, text="Status: Waiting", style="Sub.TLabel", wraplength=980)
@@ -748,15 +788,15 @@ class FaceAttendanceUI:
             style="Sub.TLabel",
         ).pack(anchor="w", pady=(4, 12))
 
-        controls = Frame(wrapper, bg="white")
+        controls = Frame(wrapper, bg="#1f2430")
         controls.pack(fill=X, pady=(0, 10))
 
         Button(
             controls,
-            text="Start Camera",
+            text="Start Stream",
             font=("Segoe UI", 9, "bold"),
-            bg="#2f7de1",
-            fg="white",
+            bg="#0077ff",
+            fg="#ffffff",
             relief=FLAT,
             bd=0,
             padx=12,
@@ -766,10 +806,10 @@ class FaceAttendanceUI:
 
         Button(
             controls,
-            text="Stop Camera",
+            text="Stop Stream",
             font=("Segoe UI", 9, "bold"),
-            bg="#9099ab",
-            fg="white",
+            bg="#2d3748",
+            fg="#a0a5b8",
             relief=FLAT,
             bd=0,
             padx=12,
@@ -777,7 +817,7 @@ class FaceAttendanceUI:
             command=self.stop_camera_preview,
         ).pack(side=LEFT)
 
-        self.camera_label = Label(wrapper, text="Camera not running", bg="#d9deea", fg="#4a5470", font=("Segoe UI", 12, "bold"))
+        self.camera_label = Label(wrapper, text="Camera not running", bg="#1f2430", fg="#e2c8a0", font=("Segoe UI", 12, "bold"))
         self.camera_label.pack(fill=BOTH, expand=True, pady=(10, 10))
 
         self.recognition_status = ttk.Label(wrapper, text="Status: Waiting", style="Sub.TLabel", wraplength=980)
@@ -821,18 +861,17 @@ class FaceAttendanceUI:
             wraplength=980,
         ).pack(anchor="w", pady=(4, 12))
 
-        diag = self.face_engine.get_backend_diagnostics()
-        students = self.repository.list_students()
-        embedding_rows = self.repository.get_all_embeddings()
+        report = self.diagnostics_service.build_report()
+        students = report["students"]
 
-        tools_row = Frame(wrapper, bg="white")
+        tools_row = Frame(wrapper, bg="#1f2430")
         tools_row.pack(fill=X, pady=(0, 10))
         Button(
             tools_row,
             text="Auto Calibrate Thresholds",
             font=("Segoe UI", 9, "bold"),
-            bg="#2f7de1",
-            fg="white",
+            bg="#c37a32",
+            fg="#ffcf8f",
             relief=FLAT,
             bd=0,
             padx=12,
@@ -854,8 +893,8 @@ class FaceAttendanceUI:
             tools_row,
             text="Personalize Calibration",
             font=("Segoe UI", 9, "bold"),
-            bg="#2f7de1",
-            fg="white",
+            bg="#c37a32",
+            fg="#ffcf8f",
             relief=FLAT,
             bd=0,
             padx=12,
@@ -867,8 +906,8 @@ class FaceAttendanceUI:
             tools_row,
             text="Reset Calibration",
             font=("Segoe UI", 9, "bold"),
-            bg="#9099ab",
-            fg="white",
+            bg="#6f6a61",
+            fg="#ffcf8f",
             relief=FLAT,
             bd=0,
             padx=12,
@@ -878,10 +917,23 @@ class FaceAttendanceUI:
 
         Button(
             tools_row,
+            text="Hard Reset Face Data",
+            font=("Segoe UI", 9, "bold"),
+            bg="#8f3830",
+            fg="#ffcf8f",
+            relief=FLAT,
+            bd=0,
+            padx=12,
+            pady=7,
+            command=self.run_hard_reset_face_data,
+        ).pack(side=LEFT, padx=(8, 0))
+
+        Button(
+            tools_row,
             text="Finalize 128-d Migration",
             font=("Segoe UI", 9, "bold"),
-            bg="#1f8f4d",
-            fg="white",
+            bg="#577e4b",
+            fg="#ffcf8f",
             relief=FLAT,
             bd=0,
             padx=12,
@@ -889,37 +941,12 @@ class FaceAttendanceUI:
             command=self.run_finalize_migration,
         ).pack(side=LEFT, padx=(8, 0))
 
-        per_student_counts: dict[str, int] = {}
-        for student_id, _ in embedding_rows:
-            per_student_counts[student_id] = per_student_counts.get(student_id, 0) + 1
+        per_student_counts = report["per_student_counts"]
 
         stats_frame = ttk.Frame(wrapper, style="Card.TFrame")
         stats_frame.pack(fill=X, pady=(0, 10))
 
-        lines = [
-            f"Active backend: {diag.get('active_backend', 'unknown')}",
-            f"deepface: {diag.get('deepface_status', 'unknown')}",
-            f"face_recognition: {diag.get('face_recognition_status', 'unknown')}",
-            f"Students registered: {len(students)}",
-            f"Total samples: {len(embedding_rows)}",
-            f"Backend-compatible samples: {self.recognition_service.known_encodings.shape[0]}",
-            f"Calibration saved: {'Yes' if Path(CALIBRATION_PATH).exists() else 'No'}",
-            f"Current distance threshold: {self.recognition_service.face_distance_threshold:.3f}",
-            f"Current cosine threshold (deepface): {self.recognition_service.deepface_cosine_threshold:.3f}",
-            f"Current cosine threshold (orb): {self.recognition_service.orb_cosine_threshold:.3f}",
-            f"Current margin: {self.recognition_service.cosine_margin:.3f}",
-            f"Personalized profiles: {len(self.recognition_service.per_student_distance_thresholds) + len(self.recognition_service.per_student_cosine_thresholds)}",
-            diag.get("notes", ""),
-        ]
-
-        dim_breakdown: dict[int, int] = {}
-        for _, emb in embedding_rows:
-            dim = int(len(emb))
-            dim_breakdown[dim] = dim_breakdown.get(dim, 0) + 1
-        if dim_breakdown:
-            parts = [f"{dim}d={count}" for dim, count in sorted(dim_breakdown.items())]
-            lines.append(f"Dimension breakdown: {', '.join(parts)}")
-        for line in lines:
+        for line in report["lines"]:
             if line:
                 ttk.Label(stats_frame, text=f"• {line}", style="Sub.TLabel", wraplength=1000, justify=LEFT).pack(anchor="w", pady=2)
 
@@ -947,14 +974,7 @@ class FaceAttendanceUI:
         guide_card.pack(fill=X, pady=(4, 0))
         ttk.Label(guide_card, text="Recommended Setup (Windows)", style="CardTitle.TLabel").pack(anchor="w", pady=(0, 8))
 
-        guide_lines = [
-            "1) Use Python 3.10 or 3.11 for best face_recognition compatibility.",
-            "2) In your virtual environment, run: pip install cmake dlib face_recognition",
-            "3) Restart the app and check this page until face_recognition is available.",
-            f"4) Capture at least {MIN_SAMPLES_PER_STUDENT}-10 clean samples per student.",
-            "5) Use Live Attendance page for marking after sample collection.",
-        ]
-        for line in guide_lines:
+        for line in report["recommended_setup"]:
             ttk.Label(guide_card, text=f"• {line}", style="Sub.TLabel", wraplength=1000, justify=LEFT).pack(anchor="w", pady=2)
 
     def run_auto_calibration(self) -> None:
@@ -1003,6 +1023,38 @@ class FaceAttendanceUI:
             f"Min mark confidence: {result.get('min_mark_confidence')}"
         )
         messagebox.showinfo("Calibration", msg)
+        self.show_page("diagnostics")
+
+    def run_hard_reset_face_data(self) -> None:
+        confirmed = messagebox.askyesno(
+            "Hard Reset Face Data",
+            (
+                "This will permanently delete ALL face samples and attendance logs.\n\n"
+                "Student profiles will be kept. Continue?"
+            ),
+        )
+        if not confirmed:
+            return
+
+        embeddings_deleted, attendance_deleted = self.repository.reset_all_face_data()
+        self.recognition_service.reset_calibration()
+        self.recognition_service.refresh_model()
+        self.recognition_service.warm_marked_today_cache()
+
+        self._attendance_dirty = True
+        self.refresh_capture_student_ids()
+        if self.active_page.get() == "attendance":
+            self.load_attendance_table()
+
+        messagebox.showinfo(
+            "Hard Reset Face Data",
+            (
+                "Fresh start complete.\n"
+                f"Deleted samples: {embeddings_deleted}\n"
+                f"Deleted attendance rows: {attendance_deleted}\n\n"
+                "Now capture fresh samples (5-10 per student) and run calibration."
+            ),
+        )
         self.show_page("diagnostics")
 
     def run_finalize_migration(self) -> None:
@@ -1081,9 +1133,15 @@ class FaceAttendanceUI:
             self._camera_mode = mode
             self._cached_faces = []
             self._cached_predictions = []
+            self._recognition_streaks = {}
+            self._detect_stride = 3 if mode == "attendance" else 2
+            self._low_motion_mode = True
+            self._latest_analysis = None
+            self._analysis_future = None
 
             # Always refresh known embeddings so recognition does not stay stale/empty.
             self.recognition_service.refresh_model()
+            self.recognition_service.warm_marked_today_cache()
 
             self.camera_service.start()
             self.schedule_camera_update()
@@ -1097,6 +1155,8 @@ class FaceAttendanceUI:
                         f"(recommended >= {MIN_SAMPLES_PER_STUDENT} samples each)"
                     )
                 )
+                if self.active_page.get() == "attendance":
+                    self._attendance_dirty = True
         except Exception as exc:
             logger.exception("Failed to start camera")
             messagebox.showerror("Camera", f"Failed to start camera: {exc}")
@@ -1105,10 +1165,123 @@ class FaceAttendanceUI:
         if self._camera_job:
             self.root.after_cancel(self._camera_job)
             self._camera_job = None
+        self._low_motion_mode = False
+        if self._analysis_future and not self._analysis_future.done():
+            self._analysis_future.cancel()
+        self._analysis_future = None
+        self._latest_analysis = None
         self.camera_service.stop()
 
     def schedule_camera_update(self) -> None:
-        self._camera_job = self.root.after(33, self.update_camera_frame)
+        self._camera_job = self.root.after(40, self.update_camera_frame)
+
+    def _submit_frame_analysis(self, frame: "cv2.Mat") -> None:
+        if self._camera_mode != "attendance":
+            return
+        if self._analysis_future and not self._analysis_future.done():
+            return
+        self._analysis_future = self._analysis_executor.submit(self._analyze_attendance_frame, frame.copy())
+
+    def _analyze_attendance_frame(self, frame_bgr) -> dict:
+        faces = self.face_engine.detect_faces(frame_bgr)
+        predictions: list[tuple[str | None, float, float]] = []
+        current_recognized_ids: set[str] = set()
+
+        for face in faces:
+            _, _, w, h = face
+            if w < CAPTURE_MIN_FACE_WIDTH or h < CAPTURE_MIN_FACE_HEIGHT:
+                predictions.append((None, 1.0, 0.0))
+                continue
+
+            fx, fy, fw, fh = face
+            live_crop = frame_bgr[max(fy, 0): fy + fh, max(fx, 0): fx + fw]
+            if live_crop.size == 0:
+                predictions.append((None, 1.0, 0.0))
+                continue
+
+            gray_live_crop = cv2.cvtColor(live_crop, cv2.COLOR_BGR2GRAY)
+            sharpness = float(cv2.Laplacian(gray_live_crop, cv2.CV_64F).var())
+            if sharpness < (CAPTURE_MIN_SHARPNESS * 0.65):
+                predictions.append((None, 1.0, 0.0))
+                continue
+
+            embedding = self.face_engine.extract_embedding(frame_bgr, face)
+            if embedding is None:
+                predictions.append((None, 1.0, 0.0))
+                continue
+
+            recognized_id, distance, confidence = self.recognition_service.predict_identity(embedding)
+            if recognized_id:
+                current_recognized_ids.add(recognized_id)
+            predictions.append((recognized_id, distance, confidence))
+
+        return {
+            "faces": faces,
+            "predictions": predictions,
+            "recognized_ids": current_recognized_ids,
+        }
+
+    def _drain_analysis_results(self) -> None:
+        if not self._analysis_future or not self._analysis_future.done():
+            return
+
+        try:
+            self._latest_analysis = self._analysis_future.result()
+            self._cached_faces = self._latest_analysis.get("faces", [])
+            self._cached_predictions = self._latest_analysis.get("predictions", [])
+            current_recognized_ids = self._latest_analysis.get("recognized_ids", set())
+            stale_ids = [sid for sid in self._recognition_streaks if sid not in current_recognized_ids]
+            for stale_id in stale_ids:
+                self._recognition_streaks[stale_id] = 0
+        except Exception:
+            logger.debug("Frame analysis failed", exc_info=True)
+        finally:
+            self._analysis_future = None
+
+    def _draw_ar_overlay(self, frame, faces, predictions):
+        """Draws a cyberpunk/AR overlay with neon brackets and tracking lines."""
+        cyan = (255, 245, 0) # BGR for Neon Cyan
+        blue = (255, 119, 0) # BGR for Electric Blue
+        
+        for idx, face in enumerate(faces):
+            x, y, w, h = face
+            # Main corners (brackets)
+            length = int(w * 0.2)
+            thickness = 2
+            
+            # Top Left
+            cv2.line(frame, (x, y), (x + length, y), cyan, thickness)
+            cv2.line(frame, (x, y), (x, y + length), cyan, thickness)
+            # Top Right
+            cv2.line(frame, (x + w, y), (x + w - length, y), cyan, thickness)
+            cv2.line(frame, (x + w, y), (x + w, y + length), cyan, thickness)
+            # Bottom Left
+            cv2.line(frame, (x, y + h), (x + length, y + h), cyan, thickness)
+            cv2.line(frame, (x, y + h), (x, y + h - length), cyan, thickness)
+            # Bottom Right
+            cv2.line(frame, (x + w, y + h), (x + w - length, y + h), cyan, thickness)
+            cv2.line(frame, (x + w, y + h), (x + w, y + h - length), cyan, thickness)
+
+            # Subtle bounding box
+            cv2.rectangle(frame, (x, y), (x + w, y + h), cyan, 1)
+
+            # Info Tag
+            recognized_id, distance, confidence = (
+                predictions[idx] if idx < len(predictions) else (None, 1.0, 0.0)
+            )
+            
+            if recognized_id:
+                name = self._student_name_cache.get(recognized_id, recognized_id).upper()
+                label = f"{name} // MATCH {confidence:.1f}%"
+                color = cyan
+            else:
+                label = f"UNKNOWN // DIST {distance:.3f}"
+                color = blue
+                
+            # Background for label
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            cv2.rectangle(frame, (x, y - th - 15), (x + tw + 10, y), color, -1)
+            cv2.putText(frame, label, (x + 5, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
 
     def update_camera_frame(self) -> None:
         frame = self.camera_service.get_frame()
@@ -1117,100 +1290,85 @@ class FaceAttendanceUI:
             self.schedule_camera_update()
             return
 
+        self._drain_analysis_results()
+
         display_frame = frame.copy()
         self._frame_counter += 1
         should_detect = (self._frame_counter % self._detect_stride) == 0
-        faces: list[tuple[int, int, int, int]] = []
-        if should_detect:
-            faces = self.face_engine.detect_faces(display_frame)
-            self._cached_faces = faces
-        elif self._cached_faces:
-            faces = self._cached_faces
+        faces: list[tuple[int, int, int, int]] = self._cached_faces
+        predictions: list[tuple[str | None, float, float]] = self._cached_predictions
 
-        max_confidence = 0.0
-        recognized_names: list[str] = []
-        marked_names: list[str] = []
-
-        if faces:
-            if self._camera_mode == "capture":
-                for x, y, w, h in faces:
-                    cv2.rectangle(display_frame, (x, y), (x + w, y + h), (47, 125, 225), 2)
-                self.stability_label.config(text=f"Detected Faces: {len(faces)}")
-                self.recognition_status.config(text="Status: Face detected. Press Capture Sample to save.")
-            else:
-                if should_detect:
-                    predictions: list[tuple[str | None, float, float]] = []
-                    for face in faces:
-                        embedding = self.face_engine.extract_embedding(frame, face)
-                        if embedding is None:
-                            predictions.append((None, 1.0, 0.0))
-                            continue
-                        predictions.append(self.recognition_service.predict_identity(embedding))
-                    self._cached_predictions = predictions
-
-                for idx, face in enumerate(faces):
-                    x, y, w, h = face
-                    recognized_id, distance, confidence = (
-                        self._cached_predictions[idx]
-                        if idx < len(self._cached_predictions)
-                        else (None, 1.0, 0.0)
-                    )
-
-                    max_confidence = max(max_confidence, confidence)
-                    if recognized_id:
-                        name = self.repository.get_student_name(recognized_id) or recognized_id
-                        recognized_names.append(name)
-                        cv2.rectangle(display_frame, (x, y), (x + w, y + h), (0, 170, 70), 2)
-                        cv2.putText(
-                            display_frame,
-                            f"{name} ({confidence:.1f}%)",
-                            (x, y - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.6,
-                            (0, 170, 70),
-                            2,
-                        )
-
-                        if should_detect:
-                            marked, _ = self.recognition_service.mark_if_eligible(recognized_id, confidence)
-                            if marked:
-                                marked_names.append(name)
-                    else:
-                        cv2.rectangle(display_frame, (x, y), (x + w, y + h), (0, 90, 220), 2)
-                        cv2.putText(
-                            display_frame,
-                            f"Unknown (score={distance:.3f})",
-                            (x, y - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.6,
-                            (0, 90, 220),
-                            2,
-                        )
-
-                unique_recognized = sorted(set(recognized_names))
-                unique_marked = sorted(set(marked_names))
-                if should_detect:
-                    if unique_marked:
-                        self.recognition_status.config(text=f"Status: Attendance marked for {', '.join(unique_marked)}")
-                    elif unique_recognized:
-                        self.recognition_status.config(text=f"Status: Recognized {', '.join(unique_recognized)}")
-                    else:
-                        self.recognition_status.config(text="Status: Unknown or low-confidence face detected")
-
-                self.stability_label.config(text=f"Detected Faces: {len(faces)}")
+        if self._camera_mode == "capture":
+            if should_detect:
+                faces = self.face_engine.detect_faces(display_frame)
+                self._cached_faces = faces
+            # In capture mode, just draw simple boxes or same AR style
+            self._draw_ar_overlay(display_frame, faces, []) 
+            self.stability_label.config(text=f"Detected Faces: {len(faces)}")
+            self.recognition_status.config(text="Status: Face detected. Press Capture Sample to save.")
         else:
-            self._cached_faces = []
-            self._cached_predictions = []
-            self.stability_label.config(text="Detected Faces: 0")
-            self.recognition_status.config(text="Status: No face detected")
+            if should_detect:
+                self._submit_frame_analysis(frame)
+                if self._latest_analysis:
+                    faces = self._latest_analysis.get("faces", self._cached_faces)
+                    predictions = self._latest_analysis.get("predictions", self._cached_predictions)
+
+            self._draw_ar_overlay(display_frame, faces, predictions)
+
             max_confidence = 0.0
+            marked_names: list[str] = []
+            status_hints: list[str] = []
+
+            for idx, face in enumerate(faces):
+                recognized_id, distance, confidence = (
+                    predictions[idx] if idx < len(predictions) else (None, 1.0, 0.0)
+                )
+                max_confidence = max(max_confidence, confidence)
+                
+                if recognized_id and should_detect:
+                    name = self._student_name_cache.get(recognized_id, recognized_id)
+                    self._recognition_streaks[recognized_id] = self._recognition_streaks.get(recognized_id, 0) + 1
+                    streak = self._recognition_streaks[recognized_id]
+
+                    required_streak = 1
+                    if streak >= required_streak:
+                        marked, reason = self.recognition_service.mark_if_eligible(recognized_id, confidence)
+                        if marked:
+                            marked_names.append(name)
+                            self._attendance_dirty = True
+                        else:
+                            status_hints.append(f"{name}: {reason}")
+                            if "already marked today" in reason.lower():
+                                self._attendance_dirty = True
+                        self._recognition_streaks[recognized_id] = 0
+                    else:
+                        status_hints.append(f"{name}: hold steady {streak}/{required_streak}")
+
+            if should_detect:
+                unique_marked = sorted(set(marked_names))
+                if unique_marked:
+                    self.recognition_status.config(text=f"Status: Attendance marked for {', '.join(unique_marked)}")
+                    if self.active_page.get() == "attendance":
+                        self.load_attendance_table()
+                elif status_hints:
+                    self.recognition_status.config(text=f"Status: {' | '.join(sorted(set(status_hints))[:2])}")
+                elif faces:
+                    self.recognition_status.config(text="Status: Analyzing neural patterns...")
+                else:
+                    self.recognition_status.config(text="Status: No subject detected")
+
+            self.stability_label.config(text=f"Detected Faces: {len(faces)}")
 
         self.confidence_bar["value"] = max_confidence
         self.confidence_label.config(text=f"Confidence: {max_confidence:.1f}%")
 
         rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
         image = Image.fromarray(rgb)
-        image = image.resize((1000, 520))
+        label_w = self.camera_label.winfo_width() if hasattr(self, "camera_label") else 0
+        label_h = self.camera_label.winfo_height() if hasattr(self, "camera_label") else 0
+        target_w = label_w if label_w > 100 else 960
+        target_h = label_h if label_h > 100 else 520
+        image = image.resize((target_w, target_h))
         photo = ImageTk.PhotoImage(image)
         self._camera_photo = photo
         self.camera_label.configure(image=photo, text="")
@@ -1376,15 +1534,15 @@ class FaceAttendanceUI:
         ttk.Label(wrapper, text="Automatic Model Management", style="CardTitle.TLabel").pack(anchor="w")
         ttk.Label(wrapper, text="Training runs automatically when you capture new face samples.", style="Sub.TLabel").pack(anchor="w", pady=(4, 12))
 
-        controls = Frame(wrapper, bg="white")
+        controls = Frame(wrapper, bg="#1f2430")
         controls.pack(fill=X)
 
         Button(
             controls,
             text="Rebuild Model Now",
             font=("Segoe UI", 9, "bold"),
-            bg="#2f7de1",
-            fg="white",
+            bg="#c37a32",
+            fg="#ffcf8f",
             relief=FLAT,
             bd=0,
             padx=14,
@@ -1392,7 +1550,7 @@ class FaceAttendanceUI:
             command=self.run_training,
         ).pack(side=LEFT)
 
-        self.training_logs = Text(wrapper, height=16, bg="#f3f5fa", fg="#2c3448", relief=FLAT, padx=10, pady=8)
+        self.training_logs = Text(wrapper, height=16, bg="#1f2430", fg="#f3d9b0", relief=FLAT, padx=10, pady=8)
         self.training_logs.pack(fill=BOTH, expand=True, pady=(12, 0))
         self.training_logs.insert(END, "[INFO] Ready for training\n")
         self.training_logs.config(state=DISABLED)
@@ -1419,12 +1577,18 @@ class FaceAttendanceUI:
         wrapper = ttk.Frame(self.body, style="Card.TFrame", padding=18)
         wrapper.pack(fill=BOTH, expand=True)
 
-        controls = Frame(wrapper, bg="white")
+        controls = Frame(wrapper, bg="#1f2430")
         controls.pack(fill=X, pady=(0, 12))
 
         ttk.Label(
             wrapper,
             text="Tip: Keep the face centered for stable recognition before marking attendance.",
+            style="Sub.TLabel",
+            wraplength=980,
+        ).pack(anchor="w", pady=(0, 8))
+        ttk.Label(
+            wrapper,
+            text="Marking rule: immediate mark on first valid recognition (subject to confidence and duplicate/cooldown checks).",
             style="Sub.TLabel",
             wraplength=980,
         ).pack(anchor="w", pady=(0, 8))
@@ -1442,8 +1606,8 @@ class FaceAttendanceUI:
             controls,
             text="Load",
             font=("Segoe UI", 9, "bold"),
-            bg="#2f7de1",
-            fg="white",
+            bg="#c37a32",
+            fg="#ffcf8f",
             relief=FLAT,
             bd=0,
             padx=12,
@@ -1455,8 +1619,8 @@ class FaceAttendanceUI:
             controls,
             text="Export CSV",
             font=("Segoe UI", 9, "bold"),
-            bg="#2f7de1",
-            fg="white",
+            bg="#c37a32",
+            fg="#ffcf8f",
             relief=FLAT,
             bd=0,
             padx=14,
@@ -1481,6 +1645,26 @@ class FaceAttendanceUI:
         self.attendance_summary.pack(anchor="w", pady=(8, 0))
 
         self.load_attendance_table()
+        self.start_attendance_auto_refresh()
+
+    def start_attendance_auto_refresh(self) -> None:
+        self.stop_attendance_auto_refresh()
+        self._attendance_refresh_ticks = 0
+        self._attendance_refresh_job = self.root.after(2500, self._auto_refresh_attendance)
+
+    def stop_attendance_auto_refresh(self) -> None:
+        if self._attendance_refresh_job:
+            self.root.after_cancel(self._attendance_refresh_job)
+            self._attendance_refresh_job = None
+
+    def _auto_refresh_attendance(self) -> None:
+        if self.active_page.get() != "attendance":
+            self._attendance_refresh_job = None
+            return
+        self._attendance_refresh_ticks += 1
+        if self._attendance_dirty or (self._attendance_refresh_ticks % 3 == 0):
+            self.load_attendance_table()
+        self._attendance_refresh_job = self.root.after(2500, self._auto_refresh_attendance)
 
     def load_attendance_table(self) -> None:
         for item in self.attendance_tree.get_children():
@@ -1489,9 +1673,18 @@ class FaceAttendanceUI:
         date_val = self.filter_date.get().strip() if hasattr(self, "filter_date") else ""
         sem_val_raw = self.filter_semester.get().strip() if hasattr(self, "filter_semester") else ""
         sem_val = self._normalize_semester_filter(sem_val_raw)
-        rows = self.repository.get_attendance(date_iso=date_val or None, section=sem_val or None)
+        normalized_date = self._normalize_date_filter(date_val)
+        rows = self.repository.get_attendance(date_iso=normalized_date or None, section=sem_val or None)
+
+        used_fallback_all_dates = False
+        if not rows and normalized_date:
+            fallback_rows = self.repository.get_attendance(date_iso=None, section=sem_val or None)
+            if fallback_rows:
+                rows = fallback_rows
+                used_fallback_all_dates = True
 
         self._last_attendance_rows = rows
+        self._attendance_dirty = False
 
         for row in rows:
             self.attendance_tree.insert(
@@ -1510,13 +1703,28 @@ class FaceAttendanceUI:
         if hasattr(self, "attendance_summary"):
             summary = f"Records: {len(rows)} | Last refresh: {datetime.now().strftime('%I:%M:%S %p')}"
 
+            if date_val and not normalized_date:
+                summary += " | Invalid date filter ignored (use YYYY-MM-DD)"
+
+            if used_fallback_all_dates:
+                summary += " | No rows for selected date; showing all dates"
+
             # Helpful hint: date filter can hide semester records from previous days.
-            if not rows and date_val and sem_val:
+            if not rows and normalized_date and sem_val:
                 semester_all_dates = self.repository.get_attendance(date_iso=None, section=sem_val)
                 if semester_all_dates:
                     summary += f" | {len(semester_all_dates)} record(s) for semester {sem_val} on other date(s)"
 
             self.attendance_summary.config(text=summary)
+
+    @staticmethod
+    def _normalize_date_filter(value: str) -> str:
+        if not value:
+            return ""
+        try:
+            return datetime.strptime(value, "%Y-%m-%d").date().isoformat()
+        except ValueError:
+            return ""
 
     @staticmethod
     def _normalize_semester_filter(value: str) -> str:
@@ -1566,6 +1774,7 @@ class FaceAttendanceUI:
                 except Exception:
                     pass
             self.stop_camera_preview()
+            self._analysis_executor.shutdown(wait=False)
         finally:
             self.root.destroy()
 

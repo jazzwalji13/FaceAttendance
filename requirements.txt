@@ -3,10 +3,11 @@ opencv-python>=4.10.0
 Pillow>=10.0.0
 scikit-learn>=1.5.0
 joblib>=1.4.0
-# Recommended high-accuracy backend:
-face-recognition>=1.3.0
-face-recognition-models>=0.3.0
-dlib-bin>=20.0.0; platform_system == "Windows"
+
+# Optional high-accuracy backends (install manually if needed):
+# face-recognition>=1.3.0
+# face-recognition-models>=0.3.0
+# dlib-bin>=20.0.0; platform_system == "Windows"
 
 # Optional alternative backend (heavier):
 # deepface>=0.0.93  # Requires tensorflow

@@ -46,8 +46,14 @@ class TrainingService:
 
         metadata = self._read_model_metadata()
         model_embedding_count = int(metadata.get("embedding_count", 0))
+        model_embedding_signature = str(metadata.get("embedding_signature", ""))
+        current_embedding_signature = self.repository.get_embedding_signature()
 
-        if not force_retrain and model_embedding_count == len(rows):
+        if (
+            not force_retrain
+            and model_embedding_count == len(rows)
+            and model_embedding_signature == current_embedding_signature
+        ):
             return True, "Model already up to date", False
 
         algorithm = self._pick_algorithm(len(unique_students), len(rows))
@@ -88,6 +94,7 @@ class TrainingService:
             "classifier": classifier,
             "algorithm": algorithm.lower(),
             "embedding_count": len(rows),
+            "embedding_signature": self.repository.get_embedding_signature(),
         }
         joblib.dump(payload, MODEL_PATH)
         logger.info("Model saved to %s", MODEL_PATH)

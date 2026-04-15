@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
 
@@ -23,6 +23,7 @@ from utils.config import (
     MIN_MARK_CONFIDENCE,
     MODEL_PATH,
     ORB_COSINE_THRESHOLD,
+    ATTENDANCE_COOLDOWN_SECONDS,
 )
 
 try:
@@ -53,6 +54,7 @@ class RecognitionService:
         self.classifier_dim: Optional[int] = None
         self._marked_today_cache: set[str] = set()
         self._marked_cache_date = date.today().isoformat()
+        self._last_marked_lookup: dict[str, datetime] = {}
         self._load_calibration()
         self.refresh_model()
 
@@ -175,7 +177,7 @@ class RecognitionService:
 
                 base = float(np.percentile(intra, 92) + 0.02)
                 safe_upper = float(nearest_other - max(self.face_distance_margin, 0.02))
-                personalized = float(max(0.34, min(0.70, safe_upper, base)))
+                personalized = float(max(0.34, min(0.55, safe_upper, base)))
                 self.per_student_distance_thresholds[sid] = personalized
                 updates += 1
             else:
@@ -237,8 +239,15 @@ class RecognitionService:
     def _refresh_marked_cache_date(self) -> None:
         today_iso = date.today().isoformat()
         if today_iso != self._marked_cache_date:
-            self._marked_today_cache.clear()
             self._marked_cache_date = today_iso
+            self._marked_today_cache = self.repository.get_marked_students_for_date(today_iso)
+            self._last_marked_lookup = {}
+
+    def warm_marked_today_cache(self) -> None:
+        today_iso = date.today().isoformat()
+        self._marked_cache_date = today_iso
+        self._marked_today_cache = self.repository.get_marked_students_for_date(today_iso)
+        self._last_marked_lookup = {}
 
     def refresh_model(self) -> None:
         rows = self.repository.get_all_embeddings()
@@ -256,6 +265,8 @@ class RecognitionService:
             self.known_student_ids = []
             self.known_encodings = np.empty((0, 0), dtype=np.float32)
             self.student_vectors = {}
+            self.classifier = None
+            self.classifier_dim = None
             return
 
         # Keep vectors that match the active backend embedding dimension.
@@ -295,6 +306,8 @@ class RecognitionService:
             self.known_student_ids = []
             self.known_encodings = np.empty((0, 0), dtype=np.float32)
             self.student_vectors = {}
+            self.classifier = None
+            self.classifier_dim = None
             return
 
         self.known_student_ids = filtered_ids
@@ -311,11 +324,15 @@ class RecognitionService:
         }
 
         if not self.student_vectors:
-            # Keep backward compatibility if sample counts are still low.
-            self.student_vectors = {
-                student_id: np.vstack(vectors).astype(np.float32)
-                for student_id, vectors in grouped.items()
-            }
+            logger.warning(
+                "No student has enough samples for recognition (need >= %s each)",
+                MIN_SAMPLES_PER_STUDENT,
+            )
+            self.known_student_ids = []
+            self.known_encodings = np.empty((0, 0), dtype=np.float32)
+            self.classifier = None
+            self.classifier_dim = None
+            return
 
         self._refresh_classifier()
 
@@ -388,8 +405,8 @@ class RecognitionService:
             centroid_dists = self._pairwise_distances(centroid_stack)
             inter_med = float(np.median(centroid_dists)) if centroid_dists.size else 1.0
 
-            new_threshold = float(np.percentile(intra_all, 90) + 0.02)
-            new_threshold = float(max(0.36, min(0.62, new_threshold)))
+            new_threshold = float(np.percentile(intra_all, 88) + 0.015)
+            new_threshold = float(max(0.34, min(0.52, new_threshold)))
 
             intra_med = float(np.median(intra_all))
             new_margin = float((inter_med - intra_med) * 0.30)
@@ -489,7 +506,17 @@ class RecognitionService:
             confidence = float(max(0.0, min(100.0, (1.0 - best_distance) * 100.0)))
             personal_threshold = self.per_student_distance_thresholds.get(best_match_id, self.face_distance_threshold)
             is_confident = best_distance <= personal_threshold
-            has_margin = (second_best_distance - best_distance) >= self.face_distance_margin
+
+            # Dynamic confusion guard: require bigger separation when candidate is farther away.
+            dynamic_margin = max(self.face_distance_margin, min(0.11, 0.045 + (best_distance * 0.08)))
+            has_margin = (second_best_distance - best_distance) >= dynamic_margin
+
+            # Reject ambiguous predictions near threshold regardless of margin.
+            near_threshold = best_distance >= (personal_threshold - 0.015)
+            weak_runner_up = second_best_distance <= (personal_threshold + 0.025)
+            if near_threshold and weak_runner_up:
+                return None, best_distance, confidence
+
             if is_confident and has_margin:
                 return best_match_id, best_distance, confidence
             return None, best_distance, confidence
@@ -562,17 +589,43 @@ class RecognitionService:
     def mark_if_eligible(self, student_id: str, confidence: float) -> tuple[bool, str]:
         self._refresh_marked_cache_date()
 
-        if confidence < self.min_mark_confidence:
-            return False, "Recognition confidence too low"
+        # A strict calibration value (e.g. 78%) can block valid recognitions from being logged.
+        # Cap it to a practical runtime threshold and rely on identity distance/margin checks for safety.
+        effective_min_confidence = min(self.min_mark_confidence, 55.0)
+
+        if confidence < effective_min_confidence:
+            return False, (
+                f"Recognition confidence too low ({confidence:.1f}% < {effective_min_confidence:.1f}%)"
+            )
 
         if student_id in self._marked_today_cache:
-            return False, "Already marked today"
+            today_iso = date.today().isoformat()
+            if self.repository.has_marked_today(student_id, today_iso):
+                updated = self.repository.update_today_attendance(student_id, confidence, status="Present")
+                if updated:
+                    now = datetime.now()
+                    self._last_marked_lookup[student_id] = now
+                    return True, "Attendance updated"
+                # Cache can be stale when logs are deleted while app is running.
+                self._marked_today_cache.discard(student_id)
+                self._last_marked_lookup.pop(student_id, None)
+            # Cache can go stale if rows are deleted/reset while app is running.
+            self._marked_today_cache.discard(student_id)
+            self._last_marked_lookup.pop(student_id, None)
 
-        today_iso = date.today().isoformat()
-        if self.repository.has_marked_today(student_id, today_iso):
-            self._marked_today_cache.add(student_id)
-            return False, "Already marked today"
+        last_marked_at = self._last_marked_lookup.get(student_id)
+        if last_marked_at is None:
+            last_marked_at = self.repository.get_last_attendance_timestamp(student_id)
+            if last_marked_at is not None:
+                self._last_marked_lookup[student_id] = last_marked_at
+
+        if last_marked_at is not None:
+            elapsed_seconds = (datetime.now() - last_marked_at).total_seconds()
+            if elapsed_seconds < ATTENDANCE_COOLDOWN_SECONDS:
+                wait_seconds = int(max(1, ATTENDANCE_COOLDOWN_SECONDS - elapsed_seconds))
+                return False, f"Cooldown active ({wait_seconds}s remaining)"
 
         self.repository.mark_attendance(student_id, confidence, status="Present")
         self._marked_today_cache.add(student_id)
+        self._last_marked_lookup[student_id] = datetime.now()
         return True, "Attendance marked"

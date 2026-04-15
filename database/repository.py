@@ -1,4 +1,5 @@
 import json
+import hashlib
 from datetime import datetime
 from typing import Optional
 
@@ -96,10 +97,32 @@ class AttendanceRepository:
                 (student_id,),
             ).rowcount
 
+    def reset_all_face_data(self) -> tuple[int, int]:
+        with self.db.connect() as conn:
+            embeddings_deleted = conn.execute("DELETE FROM face_embeddings").rowcount
+            attendance_deleted = conn.execute("DELETE FROM attendance_logs").rowcount
+        return embeddings_deleted, attendance_deleted
+
     def get_all_embeddings(self) -> list[tuple[str, list[float]]]:
         with self.db.connect() as conn:
             rows = conn.execute("SELECT student_id, embedding FROM face_embeddings").fetchall()
             return [(r["student_id"], json.loads(r["embedding"])) for r in rows]
+
+    def get_embedding_signature(self) -> str:
+        with self.db.connect() as conn:
+            rows = conn.execute(
+                "SELECT id, student_id, created_at FROM face_embeddings ORDER BY id"
+            ).fetchall()
+
+        digest = hashlib.sha256()
+        for row in rows:
+            digest.update(str(row["id"]).encode("utf-8"))
+            digest.update(b"|")
+            digest.update(str(row["student_id"]).encode("utf-8"))
+            digest.update(b"|")
+            digest.update(str(row["created_at"] or "").encode("utf-8"))
+            digest.update(b";")
+        return digest.hexdigest()
 
     def list_embedding_records(self) -> list[dict]:
         with self.db.connect() as conn:
@@ -151,6 +174,17 @@ class AttendanceRepository:
             ).fetchone()
             return row is not None
 
+    def get_marked_students_for_date(self, date_iso: str) -> set[str]:
+        with self.db.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT student_id FROM attendance_logs
+                WHERE DATE(timestamp) = DATE(?)
+                """,
+                (date_iso,),
+            ).fetchall()
+        return {str(r["student_id"]) for r in rows}
+
     def mark_attendance(self, student_id: str, confidence: float, status: str = "Present") -> AttendanceRecord:
         timestamp = datetime.now().isoformat(timespec="seconds")
         with self.db.connect() as conn:
@@ -171,11 +205,64 @@ class AttendanceRepository:
             status=status,
         )
 
+    def update_today_attendance(self, student_id: str, confidence: float, status: str = "Present") -> bool:
+        timestamp = datetime.now().isoformat(timespec="seconds")
+        with self.db.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id FROM attendance_logs
+                WHERE student_id = ? AND DATE(timestamp) = DATE(?)
+                ORDER BY timestamp DESC
+                LIMIT 1
+                """,
+                (student_id, timestamp),
+            ).fetchone()
+
+            if not row:
+                return False
+
+            conn.execute(
+                """
+                UPDATE attendance_logs
+                SET timestamp = ?, confidence = ?, status = ?
+                WHERE id = ?
+                """,
+                (timestamp, confidence, status, row["id"]),
+            )
+            return True
+
+    def get_last_attendance_timestamp(self, student_id: str) -> Optional[datetime]:
+        with self.db.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT timestamp FROM attendance_logs
+                WHERE student_id = ?
+                ORDER BY timestamp DESC
+                LIMIT 1
+                """,
+                (student_id,),
+            ).fetchone()
+
+        if not row or not row["timestamp"]:
+            return None
+
+        try:
+            return datetime.fromisoformat(str(row["timestamp"]))
+        except ValueError:
+            return None
+
     def get_attendance(self, date_iso: Optional[str] = None, section: Optional[str] = None) -> list[dict]:
         query = """
-            SELECT a.id, a.student_id, s.full_name, s.department, a.timestamp, a.confidence, a.status
+            SELECT
+                a.id,
+                a.student_id,
+                COALESCE(s.full_name, 'Unknown Student') AS full_name,
+                COALESCE(s.department, 'N/A') AS department,
+                a.timestamp,
+                a.confidence,
+                a.status
             FROM attendance_logs a
-            JOIN students s ON s.student_id = a.student_id
+            LEFT JOIN students s ON s.student_id = a.student_id
         """
         params: list[str] = []
         filters: list[str] = []
